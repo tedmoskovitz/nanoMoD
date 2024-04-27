@@ -1,4 +1,6 @@
 """
+Training works the same as for nanoGPT: 
+
 This training script can be run both on a single gpu in debug mode,
 and also in a larger training run with distributed data parallel (ddp).
 
@@ -40,9 +42,9 @@ eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
 init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
 # wandb logging
-wandb_log = False # disabled by default
+wandb_log = True # disabled by default
 wandb_project = 'owt'
-wandb_run_name = 'gpt2' # 'run' + str(time.time())
+wandb_run_name = 'run' + str(time.time()) # 'shakespeare_ee_pretrain' # 'run' + str(time.time())
 # data
 dataset = 'openwebtext'
 gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
@@ -113,13 +115,10 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 
 # poor man's data loader
 data_dir = os.path.join('data', dataset)
+train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
+val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
 def get_batch(split):
-    # We recreate np.memmap every batch to avoid a memory leak, as per
-    # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
-    if split == 'train':
-        data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
-    else:
-        data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
+    data = train_data if split == 'train' else val_data
     ix = torch.randint(len(data) - block_size, (batch_size,))
     x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
     y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
@@ -191,6 +190,7 @@ if block_size < model.config.block_size:
     model.crop_block_size(block_size)
     model_args['block_size'] = block_size # so that the checkpoint will have the right value
 model.to(device)
+train_kwargs = {}
 
 # initialize a GradScaler. If enabled=False scaler is a no-op
 scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
@@ -213,17 +213,23 @@ if ddp:
 
 # helps estimate an arbitrarily accurate loss over either split using many batches
 @torch.no_grad()
-def estimate_loss():
+def estimate_loss_and_utilization():
     out = {}
     model.eval()
     for split in ['train', 'val']:
         losses = torch.zeros(eval_iters)
+        utilizations = torch.zeros((eval_iters, n_layer, block_size))
         for k in range(eval_iters):
             X, Y = get_batch(split)
             with ctx:
-                logits, loss = model(X, Y)
+                _, loss, aux = model(X, Y, **train_kwargs)
+                if aux:
+                    utilizations[k] = aux['utilization'].detach()
             losses[k] = loss.item()
         out[split] = losses.mean()
+        utilizations = utilizations.detach().mean(dim=0)
+        utilizations = (utilizations - utilizations.min()) / (utilizations.max() - utilizations.min())
+        out[split + '_utilization'] = utilizations.cpu().numpy()
     model.train()
     return out
 
@@ -252,6 +258,7 @@ t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model # unwrap DDP container if needed
 running_mfu = -1.0
+utilization_hist = []
 while True:
 
     # determine and set the learning rate for this iteration
@@ -261,13 +268,18 @@ while True:
 
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
-        losses = estimate_loss()
+        losses = estimate_loss_and_utilization()
+        utilization_hist.append(losses['train_utilization'].flatten())
         print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
         if wandb_log:
+            utilization_train_im = wandb.Image(losses['train_utilization'], caption="train utilization")
+            utilization_val_im = wandb.Image(losses['val_utilization'], caption="val utilization")
             wandb.log({
                 "iter": iter_num,
                 "train/loss": losses['train'],
+                "train/utilization": utilization_train_im,
                 "val/loss": losses['val'],
+                "val/utilization": utilization_val_im,
                 "lr": lr,
                 "mfu": running_mfu*100, # convert to percentage
             })
@@ -297,7 +309,7 @@ while True:
             # looking at the source of that context manager, it just toggles this variable
             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
         with ctx:
-            logits, loss = model(X, Y)
+            logits, loss, _ = model(X, Y, **train_kwargs)
             loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
         X, Y = get_batch('train')
@@ -331,6 +343,16 @@ while True:
     # termination conditions
     if iter_num > max_iters:
         break
+
+if wandb_log:
+    losses = estimate_loss_and_utilization()
+    n_params = model.get_num_params()
+    data_tr = [[n_params, losses['train']]]
+    data_val = [[n_params, losses['val']]]
+    table_tr = wandb.Table(data=data_tr, columns=["n_params", "loss"])
+    table_val = wandb.Table(data=data_val, columns=["n_params", "loss"])
+    wandb.log({"train": wandb.plot.scatter(table_tr, x="n_params", y="loss", title="Train loss vs. #params"),
+              "val": wandb.plot.scatter(table_val, x="n_params", y="loss", title="Val loss vs. #params")})
 
 if ddp:
     destroy_process_group()

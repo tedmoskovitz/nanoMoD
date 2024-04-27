@@ -1,10 +1,6 @@
 """
-Full definition of a GPT Language Model, all of it in this single file.
-References:
-1) the official GPT-2 TensorFlow implementation released by OpenAI:
-https://github.com/openai/gpt-2/blob/master/src/model.py
-2) huggingface/transformers PyTorch implementation:
-https://github.com/huggingface/transformers/blob/main/src/transformers/models/gpt2/modeling_gpt2.py
+A minimalist add-on of Mixture-of-Depths (https://arxiv.org/abs/2404.02258) blocks 
+to nanoGPT (https://github.com/karpathy/nanoGPT). 
 """
 
 import math
@@ -103,7 +99,36 @@ class Block(nn.Module):
     def forward(self, x):
         x = x + self.attn(self.ln_1(x))
         x = x + self.mlp(self.ln_2(x))
-        return x
+        return x, None
+
+
+class MoDBlock(nn.Module):
+
+  def __init__(self, config):
+    super().__init__()
+    self.router = nn.Linear(config.n_embd, 1, bias=False)
+    self.block = Block(config)
+    self.capacity = config.capacity
+
+  def forward(self, x_BTD):
+    B, T, _ = x_BTD.shape
+    router_scores_BT = self.router(x_BTD).squeeze(2)
+    top_rvals_BK, top_ridxs_BK = torch.topk(router_scores_BT, self.capacity, dim=1)
+
+    # aux: track routing of tokens ###########
+    # Create a binary mask of shape (B, T, K)
+    mask_BTK = torch.zeros(B, T, self.capacity, dtype=torch.bool, device=x_BTD.device)
+    mask_BTK.scatter_(1, top_ridxs_BK.unsqueeze(1), True)
+    # Sum the mask along the K dimension and average over the B dimension
+    utilization_T = mask_BTK.sum(dim=-1).float().mean(dim=0)
+    ###########################################
+
+    batch_indices_BK = torch.arange(B).unsqueeze(1).expand(B, self.capacity)
+    x_BKD = x_BTD[batch_indices_BK, top_ridxs_BK]
+    x_BKD = top_rvals_BK[..., None] * self.block(x_BKD)[0] + x_BKD
+    out_BTD = x_BTD.scatter(1, top_ridxs_BK[..., None].expand(-1, -1, x_BTD.shape[-1]), x_BKD)
+    aux = dict(utilization=utilization_T)
+    return out_BTD, aux
 
 @dataclass
 class GPTConfig:
@@ -112,6 +137,7 @@ class GPTConfig:
     n_layer: int = 12
     n_head: int = 12
     n_embd: int = 768
+    capacity: int = 768 // 8
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
 
@@ -123,11 +149,18 @@ class GPT(nn.Module):
         assert config.block_size is not None
         self.config = config
 
+        MoDBlockList = []
+        for l in range(config.n_layer):
+            if l % 2 == 0:
+                MoDBlockList.append(MoDBlock(config))
+            else:
+                MoDBlockList.append(Block(config))
+
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
-            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+            h = nn.ModuleList(MoDBlockList),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
@@ -177,9 +210,12 @@ class GPT(nn.Module):
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
+        utilization_list = []
         for block in self.transformer.h:
-            x = block(x)
+            x, aux = block(x)
+            utilization_list.append(aux['utilization'] if aux else torch.ones(self.config.block_size, device=device))
         x = self.transformer.ln_f(x)
+        utilization_LT = torch.stack(utilization_list[::-1], dim=0) # top layer on the top
 
         if targets is not None:
             # if we are given some desired targets also calculate the loss
@@ -190,7 +226,8 @@ class GPT(nn.Module):
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
             loss = None
 
-        return logits, loss
+        aux = dict(utilization=utilization_LT)
+        return logits, loss, aux
 
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary
@@ -293,7 +330,7 @@ class GPT(nn.Module):
         N = self.get_num_params()
         cfg = self.config
         L, H, Q, T = cfg.n_layer, cfg.n_head, cfg.n_embd//cfg.n_head, cfg.block_size
-        flops_per_token = 6*N + 12*L*H*Q*T
+        flops_per_token = 6*N + 9*L*H*Q*T  # 12 -> 9 (modified to reflect MoD blocks)
         flops_per_fwdbwd = flops_per_token * T
         flops_per_iter = flops_per_fwdbwd * fwdbwd_per_iter
         # express our flops throughput as ratio of A100 bfloat16 peak flops
