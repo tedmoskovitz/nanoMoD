@@ -17,15 +17,14 @@ class MoDBlock(nn.Module):
     self.capacity = config.capacity
 
   def forward(self, x_BTD):
-    B, T, _ = x_BTD.shape
+    B, T, D = x_BTD.shape
     router_scores_BT = self.router(x_BTD).squeeze(2)
     top_rvals_BK, top_ridxs_BK = torch.topk(router_scores_BT, self.capacity, dim=1)
     batch_indices_BK = torch.arange(B).unsqueeze(1).expand(B, self.capacity)
     x_BKD = x_BTD[batch_indices_BK, top_ridxs_BK]
     x_BKD = top_rvals_BK[..., None] * self.block(x_BKD)[0] + x_BKD
     out_BTD = x_BTD.scatter(1, top_ridxs_BK[..., None].expand(-1, -1, x_BTD.shape[-1]), x_BKD)
-    aux = dict(utilization=utilization_T)
-    return out_BTD, aux
+    return out_BTD
 ```
 
 I've only tried out small-scale experiments on the Shakespeare corpus, but results seem consistent with those reported in the MoD paper. You can initiate training with the following command: `python train.py config/train_shakespeare_char.py`. 
