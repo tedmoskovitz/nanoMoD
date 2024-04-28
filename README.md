@@ -30,6 +30,6 @@ class MoDBlock(nn.Module):
 I've only tried out small-scale experiments on the Shakespeare corpus, but results seem consistent with those reported in the MoD paper. You can initiate training with the following command: `python train.py config/train_shakespeare_char.py`. 
 
 
-A major TODO right now is to implement autoregressive sampling. Have fun! 
+A major TODO right now is to implement autoregressive sampling. 
 
 ![loss](assets/mod_loss_curve.jpeg)
